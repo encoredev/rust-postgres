@@ -113,6 +113,34 @@ where
     Ok((client, connection))
 }
 
+pub async fn connect_proxy_raw<S, T>(
+    stream: S,
+    tls: T,
+    has_hostname: bool,
+    config: &Config,
+) -> Result<Framed<MaybeTlsStream<S, T::Stream>, PostgresCodec>, Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        T: TlsConnect<S>,
+{
+    let stream = connect_tls(stream, config.ssl_mode, tls, has_hostname).await?;
+
+    let mut stream = StartupStream {
+        inner: Framed::new(stream, PostgresCodec),
+        buf: BackendMessages::empty(),
+        delayed: VecDeque::new(),
+    };
+
+    let user = config
+        .user
+        .as_deref()
+        .map_or_else(|| Cow::Owned(whoami::username()), Cow::Borrowed);
+
+    startup(&mut stream, config, &user).await?;
+    authenticate(&mut stream, config, &user).await?;
+    Ok(stream.inner)
+}
+
 async fn startup<S, T>(
     stream: &mut StartupStream<S, T>,
     config: &Config,

@@ -1,14 +1,16 @@
 #![allow(missing_docs)]
 
-use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
-use bytes::{Bytes, BytesMut};
-use fallible_iterator::FallibleIterator;
-use memchr::memchr;
-use std::cmp;
 use std::io::{self, Read};
 use std::ops::Range;
 use std::str;
 
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::{Bytes, BytesMut};
+use fallible_iterator::FallibleIterator;
+use memchr::memchr;
+use crate::message::shared;
+
+use crate::message::shared::Buffer;
 use crate::Oid;
 
 pub const PARSE_COMPLETE_TAG: u8 = b'1';
@@ -33,43 +35,7 @@ pub const PARAMETER_DESCRIPTION_TAG: u8 = b't';
 pub const ROW_DESCRIPTION_TAG: u8 = b'T';
 pub const READY_FOR_QUERY_TAG: u8 = b'Z';
 
-#[derive(Debug, Copy, Clone)]
-pub struct Header {
-    tag: u8,
-    len: i32,
-}
-
-#[allow(clippy::len_without_is_empty)]
-impl Header {
-    #[inline]
-    pub fn parse(buf: &[u8]) -> io::Result<Option<Header>> {
-        if buf.len() < 5 {
-            return Ok(None);
-        }
-
-        let tag = buf[0];
-        let len = BigEndian::read_i32(&buf[1..]);
-
-        if len < 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid message length: header length < 4",
-            ));
-        }
-
-        Ok(Some(Header { tag, len }))
-    }
-
-    #[inline]
-    pub fn tag(self) -> u8 {
-        self.tag
-    }
-
-    #[inline]
-    pub fn len(self) -> i32 {
-        self.len
-    }
-}
+pub use shared::Header;
 
 /// An enum representing Postgres backend messages.
 #[non_exhaustive]
@@ -275,61 +241,6 @@ impl Message {
         }
 
         Ok(Some(message))
-    }
-}
-
-struct Buffer {
-    bytes: Bytes,
-    idx: usize,
-}
-
-impl Buffer {
-    #[inline]
-    fn slice(&self) -> &[u8] {
-        &self.bytes[self.idx..]
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.slice().is_empty()
-    }
-
-    #[inline]
-    fn read_cstr(&mut self) -> io::Result<Bytes> {
-        match memchr(0, self.slice()) {
-            Some(pos) => {
-                let start = self.idx;
-                let end = start + pos;
-                let cstr = self.bytes.slice(start..end);
-                self.idx = end + 1;
-                Ok(cstr)
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unexpected EOF",
-            )),
-        }
-    }
-
-    #[inline]
-    fn read_all(&mut self) -> Bytes {
-        let buf = self.bytes.slice(self.idx..);
-        self.idx = self.bytes.len();
-        buf
-    }
-}
-
-impl Read for Buffer {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = {
-            let slice = self.slice();
-            let len = cmp::min(slice.len(), buf.len());
-            buf[..len].copy_from_slice(&slice[..len]);
-            len
-        };
-        self.idx += len;
-        Ok(len)
     }
 }
 
