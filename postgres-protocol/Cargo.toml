@@ -24,3 +24,4 @@ rand = "0.8"
 sha2 = "0.10"
 stringprep = "0.1"
 getrandom = { version = "0.2", optional = true }
+log = "0.4.20"

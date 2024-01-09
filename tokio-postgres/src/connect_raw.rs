@@ -1,25 +1,28 @@
-use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
-use crate::config::{self, Config};
-use crate::connect_tls::connect_tls;
-use crate::maybe_tls_stream::MaybeTlsStream;
-use crate::tls::{TlsConnect, TlsStream};
-use crate::{Client, Connection, Error};
-use bytes::BytesMut;
-use fallible_iterator::FallibleIterator;
-use futures_channel::mpsc;
-use futures_util::{ready, Sink, SinkExt, Stream, TryStreamExt};
-use postgres_protocol::authentication;
-use postgres_protocol::authentication::sasl;
-use postgres_protocol::authentication::sasl::ScramSha256;
-use postgres_protocol::message::backend::{AuthenticationSaslBody, Message};
-use postgres_protocol::message::frontend;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+use bytes::BytesMut;
+use fallible_iterator::FallibleIterator;
+use futures_channel::mpsc;
+use futures_util::{ready, Sink, SinkExt, Stream, TryStreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
+
+use postgres_protocol::authentication;
+use postgres_protocol::authentication::sasl;
+use postgres_protocol::authentication::sasl::ScramSha256;
+use postgres_protocol::message::backend::{AuthenticationSaslBody, Message};
+use postgres_protocol::message::frontend;
+
+use crate::{Client, Connection, Error};
+use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
+use crate::config::{self, Config};
+use crate::connect_tls::connect_tls;
+use crate::maybe_tls_stream::MaybeTlsStream;
+use crate::tls::{TlsConnect, TlsStream};
 
 pub struct StartupStream<S, T> {
     inner: Framed<MaybeTlsStream<S, T>, PostgresCodec>,
@@ -111,6 +114,36 @@ where
     let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
 
     Ok((client, connection))
+}
+
+
+pub async fn connect_proxy_raw<S, T>(
+    stream: S,
+    tls: T,
+    has_hostname: bool,
+    config: &Config,
+) -> Result<(Framed<MaybeTlsStream<S, T::Stream>, PostgresCodec>, i32, i32, HashMap<String, String>), Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        T: TlsConnect<S>,
+{
+    let stream = connect_tls(stream, config.ssl_mode, tls, has_hostname).await?;
+
+    let mut stream = StartupStream {
+        inner: Framed::new(stream, PostgresCodec),
+        buf: BackendMessages::empty(),
+        delayed: VecDeque::new(),
+    };
+
+    let user = config
+        .user
+        .as_deref()
+        .map_or_else(|| Cow::Owned(whoami::username()), Cow::Borrowed);
+
+    startup(&mut stream, config, &user).await?;
+    authenticate(&mut stream, config, &user).await?;
+    let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
+    Ok((stream.inner, process_id, secret_key, parameters))
 }
 
 async fn startup<S, T>(
