@@ -97,8 +97,13 @@ impl<B> ProxyManager<B>
         // Phase 2: backend startup
         let backend_info = match connect_proxy(&mut accept.tls, &accept.backend_config).await {
             Ok(backend_info) => backend_info,
-            Err(_) => {
-                _ = startup_stream.send(StartupResponse::ErrorResponse("backend connection failed".to_string())).await;
+            Err(err) => {
+                _ = startup_stream
+                    .send(StartupResponse::ErrorResponse(format!(
+                        "backend connection failed: {:?}",
+                        err
+                    )))
+                    .await;
                 return;
             }
         };
