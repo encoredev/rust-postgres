@@ -484,14 +484,7 @@ impl Client {
                     return;
                 }
 
-                let buf = self.client.inner().with_buf(|buf| {
-                    frontend::query("ROLLBACK", buf).unwrap();
-                    buf.split().freeze()
-                });
-                let _ = self
-                    .client
-                    .inner()
-                    .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
+                self.client.__private_api_rollback(None);
             }
         }
 
@@ -577,6 +570,21 @@ impl Client {
     #[doc(hidden)]
     pub fn __private_api_close(&mut self) {
         self.inner.sender.close_channel()
+    }
+
+    #[doc(hidden)]
+    pub fn __private_api_rollback(&self, name: Option<&str>) {
+        let buf = self.inner().with_buf(|buf| {
+            if let Some(name) = name {
+                frontend::query(&format!("ROLLBACK TO {}", name), buf).unwrap();
+            } else {
+                frontend::query("ROLLBACK", buf).unwrap();
+            }
+            buf.split().freeze()
+        });
+        let _ = self
+            .inner()
+            .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
     }
 }
 
