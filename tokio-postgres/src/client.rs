@@ -1,4 +1,4 @@
-use crate::codec::BackendMessages;
+use crate::codec::{BackendMessages, FrontendMessage};
 use crate::config::{SslMode, SslNegotiation};
 use crate::connection::{Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
@@ -22,6 +22,7 @@ use futures_channel::mpsc;
 use futures_util::{future, pin_mut, ready, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use postgres_protocol::message::backend::Message;
+use postgres_protocol::message::frontend;
 use postgres_types::BorrowToSql;
 use std::collections::HashMap;
 use std::fmt;

@@ -1,30 +1,30 @@
 #![allow(missing_docs)]
 
-mod startup;
 mod auth;
+mod startup;
 
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use bytes::Bytes;
 
-use futures_util::{SinkExt, try_join};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
+use futures_util::{try_join, SinkExt};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, FramedParts};
 
 use postgres_protocol::message::startup::{CancelData, StartupData, StartupResponse};
 
-use crate::{CancelToken, Config, Error, Socket};
+use crate::config::SslNegotiation;
 use crate::connect_proxy::{connect_proxy, ProxyInfo};
 use crate::proxy::startup::{read_frontend_startup, StartupCodec, StartupInfo};
 use crate::tls::{MakeTlsConnect, TlsConnect};
+use crate::{CancelToken, Config, Error, Socket};
 
 /// A trait for determining if, and where, to route an incoming client connection.
-pub trait ClientBouncer: Clone + Sync + Send + 'static
-{
+pub trait ClientBouncer: Clone + Sync + Send + 'static {
     type Tls: MakeTlsConnect<Socket> + Send + Clone + 'static;
-    type Future: Future<Output=Result<AcceptConn<Self::Tls>, RejectConn>> + Send + 'static;
+    type Future: Future<Output = Result<AcceptConn<Self::Tls>, RejectConn>> + Send + 'static;
 
     /// Handles a startup message from a client.
     /// Returns a `BackendConfig` if the connection should be proxied to a backend,
@@ -62,21 +62,22 @@ pub enum AuthMethod {
 
 #[derive(Clone)]
 pub struct ProxyManager<B>
-    where B: ClientBouncer
+where
+    B: ClientBouncer,
 {
     bouncer: B,
 
     /// The cancel handles for active connections, keyed by the process ID and secret key.
-    cancel_handles: Arc<tokio::sync::RwLock<HashMap<CancelKey, CancelHandle<B::Tls>>>>
+    cancel_handles: Arc<tokio::sync::RwLock<HashMap<CancelKey, CancelHandle<B::Tls>>>>,
 }
 
 /// Handles proxying connections from clients to backends.
 impl<B> ProxyManager<B>
-    where
-        B: ClientBouncer,
-        <B::Tls as MakeTlsConnect<Socket>>::TlsConnect: Send,
-        <B::Tls as MakeTlsConnect<Socket>>::Stream: Send,
-        <<B::Tls as MakeTlsConnect<Socket>>::TlsConnect as TlsConnect<Socket>>::Future: Send,
+where
+    B: ClientBouncer,
+    <B::Tls as MakeTlsConnect<Socket>>::TlsConnect: Send,
+    <B::Tls as MakeTlsConnect<Socket>>::Stream: Send,
+    <<B::Tls as MakeTlsConnect<Socket>>::TlsConnect as TlsConnect<Socket>>::Future: Send,
 {
     pub fn new(bouncer: B) -> Self {
         Self {
@@ -109,7 +110,10 @@ impl<B> ProxyManager<B>
         };
 
         // Notify the client that authentication is successful.
-        if let Err(_) = self.complete_client_init(&mut startup_stream, &backend_info).await {
+        if let Err(_) = self
+            .complete_client_init(&mut startup_stream, &backend_info)
+            .await
+        {
             // Client is gone.
             return;
         }
@@ -129,9 +133,11 @@ impl<B> ProxyManager<B>
                     ssl_mode: accept.backend_config.ssl_mode,
                     process_id: backend_info.process_id,
                     secret_key: backend_info.secret_key,
+                    ssl_negotiation: SslNegotiation::Postgres,
                 },
                 tls: accept.tls,
-            }).await;
+            })
+            .await;
             reg
         };
 
@@ -154,9 +160,12 @@ impl<B> ProxyManager<B>
     /// Handles starting up a client connection.
     /// It returns None if the connection should be closed, whether for authentication issues
     /// or because the client requested cancellation.
-    async fn client_startup<S>(&self, startup_stream: &mut Framed<S, StartupCodec>) -> Option<AcceptConn<B::Tls>>
-        where
-            S: AsyncRead + AsyncWrite + Unpin
+    async fn client_startup<S>(
+        &self,
+        startup_stream: &mut Framed<S, StartupCodec>,
+    ) -> Option<AcceptConn<B::Tls>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         // Read the startup message.
         match read_frontend_startup(startup_stream).await.ok()? {
@@ -173,7 +182,11 @@ impl<B> ProxyManager<B>
                 match self.bouncer.handle_startup(&startup_data).await {
                     Ok(accept) => {
                         // Authenticate the user.
-                        match accept.auth_method.authenticate(startup_stream, &startup_data).await {
+                        match accept
+                            .auth_method
+                            .authenticate(startup_stream, &startup_data)
+                            .await
+                        {
                             Ok(()) => {
                                 // Successfully authenticated.
                                 Some(accept)
@@ -183,14 +196,22 @@ impl<B> ProxyManager<B>
                                 log::error!("authentication failed: {}", err);
 
                                 // Ignore error from sending to client; we already have an error to return.
-                                _ = startup_stream.send(StartupResponse::ErrorResponse("authentication failed".to_string())).await;
+                                _ = startup_stream
+                                    .send(StartupResponse::ErrorResponse(
+                                        "authentication failed".to_string(),
+                                    ))
+                                    .await;
                                 None
                             }
                         }
                     }
                     Err(_reject) => {
                         // Ignore error from sending to client; we already have an error to return.
-                        _ = startup_stream.send(StartupResponse::ErrorResponse("connection rejected".to_string())).await;
+                        _ = startup_stream
+                            .send(StartupResponse::ErrorResponse(
+                                "connection rejected".to_string(),
+                            ))
+                            .await;
                         None
                     }
                 }
@@ -198,15 +219,26 @@ impl<B> ProxyManager<B>
         }
     }
 
-    async fn complete_client_init<S>(&self, startup_stream: &mut Framed<S, StartupCodec>, backend_info: &ProxyInfo<B::Tls>) -> Result<(), Error>
-    where S: AsyncRead + AsyncWrite + Unpin
+    async fn complete_client_init<S>(
+        &self,
+        startup_stream: &mut Framed<S, StartupCodec>,
+        backend_info: &ProxyInfo<B::Tls>,
+    ) -> Result<(), Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         // Notify the client the authentication is successful.
-        startup_stream.feed(StartupResponse::AuthenticationOk).await.map_err(Error::io)?;
+        startup_stream
+            .feed(StartupResponse::AuthenticationOk)
+            .await
+            .map_err(Error::io)?;
 
         // Send backend parameters, sorted by key.
-        let mut parameters = backend_info.parameters.iter().map(|(k, v)| {
-            (k.clone(), v.clone()) }).collect::<Vec<_>>();
+        let mut parameters = backend_info
+            .parameters
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
 
         parameters.sort_by(|a, b| a.0.cmp(&b.0));
         for (key, value) in parameters {
@@ -218,7 +250,10 @@ impl<B> ProxyManager<B>
         }
 
         // Send ReadyForQuery
-        startup_stream.feed(StartupResponse::ReadyForQuery).await.map_err(Error::io)?;
+        startup_stream
+            .feed(StartupResponse::ReadyForQuery)
+            .await
+            .map_err(Error::io)?;
 
         // Flush the stream.
         startup_stream.flush().await.map_err(Error::io)?;
@@ -244,15 +279,17 @@ async fn proxy_data<C, CC, S, SC>(
     client: &mut FramedParts<C, CC>,
     server: &mut FramedParts<S, SC>,
 ) -> Result<(), Error>
-    where
-        C: AsyncRead + AsyncWrite + Unpin,
-        S: AsyncRead + AsyncWrite + Unpin,
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     // Write all pending data
     write_pending(client, server).await?;
 
     // Copy data in both directions until EOF is reached.
-    copy_bidirectional(&mut client.io, &mut server.io).await.map_err(Error::io)?;
+    copy_bidirectional(&mut client.io, &mut server.io)
+        .await
+        .map_err(Error::io)?;
 
     Ok(())
 }
@@ -261,9 +298,9 @@ async fn write_pending<C, CC, S, SC>(
     client: &mut FramedParts<C, CC>,
     server: &mut FramedParts<S, SC>,
 ) -> Result<(), Error>
-    where
-        C: AsyncRead + AsyncWrite + Unpin,
-        S: AsyncRead + AsyncWrite + Unpin,
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     // Write unwritten data.
     let a = server.io.write_all(&server.write_buf);
@@ -287,7 +324,6 @@ struct CancelKey {
     process_id: i32,
     secret_key: i32,
 }
-
 
 struct CancelHandleRegistration<T> {
     key: CancelKey,

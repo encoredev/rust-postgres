@@ -17,12 +17,12 @@ use postgres_protocol::authentication::sasl::ScramSha256;
 use postgres_protocol::message::backend::{AuthenticationSaslBody, Message};
 use postgres_protocol::message::frontend;
 
-use crate::{Client, Connection, Error};
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
-use crate::config::{self, Config};
+use crate::config::{self, Config, SslNegotiation};
 use crate::connect_tls::connect_tls;
 use crate::maybe_tls_stream::MaybeTlsStream;
 use crate::tls::{TlsConnect, TlsStream};
+use crate::{Client, Connection, Error};
 
 pub struct StartupStream<S, T> {
     inner: Framed<MaybeTlsStream<S, T>, PostgresCodec>,
@@ -129,18 +129,32 @@ where
     Ok((client, connection))
 }
 
-
 pub async fn connect_proxy_raw<S, T>(
     stream: S,
     tls: T,
     has_hostname: bool,
     config: &Config,
-) -> Result<(Framed<MaybeTlsStream<S, T::Stream>, PostgresCodec>, i32, i32, HashMap<String, String>), Error>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-        T: TlsConnect<S>,
+) -> Result<
+    (
+        Framed<MaybeTlsStream<S, T::Stream>, PostgresCodec>,
+        i32,
+        i32,
+        HashMap<String, String>,
+    ),
+    Error,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: TlsConnect<S>,
 {
-    let stream = connect_tls(stream, config.ssl_mode, tls, has_hostname).await?;
+    let stream = connect_tls(
+        stream,
+        config.ssl_mode,
+        SslNegotiation::Postgres,
+        tls,
+        has_hostname,
+    )
+    .await?;
 
     let mut stream = StartupStream {
         inner: Framed::new(stream, PostgresCodec),

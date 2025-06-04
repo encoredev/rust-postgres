@@ -1,11 +1,10 @@
-use std::{cmp, io};
 use std::collections::HashMap;
+use std::{cmp, io};
 
 use rand::seq::SliceRandom;
 use tokio::net;
 use tokio_util::codec::Framed;
 
-use crate::{Config, Error, Socket};
 use crate::client::{Addr, SocketConfig};
 use crate::codec::PostgresCodec;
 use crate::config::{Host, LoadBalanceHosts};
@@ -13,6 +12,7 @@ use crate::connect_raw::connect_proxy_raw;
 use crate::connect_socket::connect_socket;
 use crate::maybe_tls_stream::MaybeTlsStream;
 use crate::tls::MakeTlsConnect;
+use crate::{Config, Error, Socket};
 
 pub(crate) struct ProxyInfo<T>
 where
@@ -25,10 +25,7 @@ where
     pub parameters: HashMap<String, String>,
 }
 
-pub(crate) async fn connect_proxy<T>(
-    tls: &mut T,
-    config: &Config,
-) -> Result<ProxyInfo<T>, Error>
+pub(crate) async fn connect_proxy<T>(tls: &mut T, config: &Config) -> Result<ProxyInfo<T>, Error>
 where
     T: MakeTlsConnect<Socket>,
 {
@@ -59,7 +56,7 @@ where
 
     let mut indices = (0..num_hosts).collect::<Vec<_>>();
     if config.load_balance_hosts == LoadBalanceHosts::Random {
-        indices.shuffle(&mut rand::thread_rng());
+        indices.shuffle(&mut rand::rng());
     }
 
     let mut error = None;
@@ -116,7 +113,7 @@ where
                 .collect::<Vec<_>>();
 
             if config.load_balance_hosts == LoadBalanceHosts::Random {
-                addrs.shuffle(&mut rand::thread_rng());
+                addrs.shuffle(&mut rand::rng());
             }
 
             let mut last_err = None;
@@ -174,7 +171,8 @@ where
         .map_err(|e| Error::tls(e.into()))?;
     let has_hostname = hostname.is_some();
 
-    let (stream, process_id, secret_key, parameters) = connect_proxy_raw(socket, tls, has_hostname, config).await?;
+    let (stream, process_id, secret_key, parameters) =
+        connect_proxy_raw(socket, tls, has_hostname, config).await?;
 
     let socket_config = SocketConfig {
         addr,
@@ -188,5 +186,11 @@ where
             None
         },
     };
-    Ok(ProxyInfo { backend: stream, socket_config, process_id, secret_key, parameters })
+    Ok(ProxyInfo {
+        backend: stream,
+        socket_config,
+        process_id,
+        secret_key,
+        parameters,
+    })
 }
