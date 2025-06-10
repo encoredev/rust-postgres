@@ -120,9 +120,10 @@ where
         };
 
         // Notify the client that authentication is successful.
-        if let Err(_) = self
+        if self
             .complete_client_init(&mut startup_stream, &backend_info)
             .await
+            .is_err()
         {
             // Client is gone.
             return;
