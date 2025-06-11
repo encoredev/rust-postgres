@@ -86,9 +86,21 @@ where
             None => host.cloned().unwrap(),
         };
 
+        let addr_str = match addr {
+            Host::Tcp(ref host) => host.to_owned(),
+            _ => "".to_string(),
+        };
+
         match connect_host(addr, hostname, port, tls, config).await {
             Ok(info) => return Ok(info),
-            Err(e) => error = Some(e),
+            Err(e) => {
+                log::error!(
+                    "failed connecting to database at {}:{}, {e}",
+                    addr_str,
+                    port
+                );
+                error = Some(e)
+            }
         }
     }
 
