@@ -194,7 +194,7 @@ where
 {
     debug!("executing copy in statement {}", statement.name());
 
-    let buf = query::encode(client, &statement, slice_iter(&[]))?;
+    let buf = query::encode(client, &statement, slice_iter(&[]), query::ResultFormat::Binary)?;
 
     let (mut sender, receiver) = mpsc::channel(1);
     let receiver = CopyInReceiver::new(receiver);
