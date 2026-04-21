@@ -91,6 +91,7 @@ where
         statement,
         responses,
         rows_affected: None,
+        command_tag: None,
         _p: PhantomPinned,
     })
 }
@@ -129,6 +130,7 @@ where
                     statement: Statement::unnamed(vec![], vec![]),
                     responses,
                     rows_affected: None,
+                    command_tag: None,
                     _p: PhantomPinned,
                 });
             }
@@ -149,6 +151,7 @@ where
                     statement: Statement::unnamed(vec![], columns),
                     responses,
                     rows_affected: None,
+                    command_tag: None,
                     _p: PhantomPinned,
                 });
             }
@@ -174,6 +177,7 @@ pub async fn query_portal(
         statement: portal.statement().clone(),
         responses,
         rows_affected: None,
+        command_tag: None,
         _p: PhantomPinned,
     })
 }
@@ -331,6 +335,7 @@ pin_project! {
         statement: Statement,
         responses: Responses,
         rows_affected: Option<u64>,
+        command_tag: Option<String>,
         #[pin]
         _p: PhantomPinned,
     }
@@ -348,6 +353,7 @@ impl Stream for RowStream {
                 }
                 Message::CommandComplete(body) => {
                     *this.rows_affected = Some(extract_row_affected(&body)?);
+                    *this.command_tag = extract_command_tag(&body).ok();
                 }
                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
                 Message::ReadyForQuery(_) => return Poll::Ready(None),
@@ -357,11 +363,35 @@ impl Stream for RowStream {
     }
 }
 
+/// Extract the command name (e.g. "SELECT", "INSERT") from a command complete tag.
+fn extract_command_tag(body: &CommandCompleteBody) -> Result<String, Error> {
+    let tag = body.tag().map_err(Error::parse)?;
+    // Tags look like "SELECT 5", "INSERT 0 1", "UPDATE 3", "DELETE 2", "CREATE TABLE"
+    // The command is everything before the last space-separated number(s).
+    Ok(tag
+        .split(' ')
+        .take_while(|part| part.parse::<u64>().is_err())
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
 impl RowStream {
+    /// Returns information about the columns of data in the rows.
+    pub fn columns(&self) -> &[Column] {
+        self.statement.columns()
+    }
+
     /// Returns the number of rows affected by the query.
     ///
     /// This function will return `None` until the stream has been exhausted.
     pub fn rows_affected(&self) -> Option<u64> {
         self.rows_affected
+    }
+
+    /// Returns the command tag from the query (e.g. "SELECT", "INSERT", "UPDATE").
+    ///
+    /// This function will return `None` until the stream has been exhausted.
+    pub fn command_tag(&self) -> Option<&str> {
+        self.command_tag.as_deref()
     }
 }
