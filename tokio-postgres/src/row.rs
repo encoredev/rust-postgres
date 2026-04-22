@@ -184,8 +184,13 @@ impl Row {
         FromSql::from_sql_nullable(ty, self.col_buffer(idx)).map_err(|e| Error::from_sql(e, idx))
     }
 
-    /// Get the raw bytes for the column at the given index.
-    fn col_buffer(&self, idx: usize) -> Option<&[u8]> {
+    /// Returns the raw bytes for the column at the given index.
+    ///
+    /// Returns `None` if the value is SQL NULL.
+    /// With `ResultFormat::Text`, the bytes are the UTF-8 text representation
+    /// of the value — the same format PostgreSQL sends to text-mode clients.
+    /// With `ResultFormat::Binary`, the bytes are binary-encoded.
+    pub fn col_buffer(&self, idx: usize) -> Option<&[u8]> {
         let range = self.ranges[idx].to_owned()?;
         Some(&self.body.buffer()[range])
     }

@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 pub async fn copy_out(client: &InnerClient, statement: Statement) -> Result<CopyOutStream, Error> {
     debug!("executing copy out statement {}", statement.name());
 
-    let buf = query::encode(client, &statement, slice_iter(&[]))?;
+    let buf = query::encode(client, &statement, slice_iter(&[]), query::ResultFormat::Binary)?;
     let responses = start(client, buf).await?;
     Ok(CopyOutStream {
         responses,

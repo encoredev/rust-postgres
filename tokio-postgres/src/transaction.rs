@@ -135,6 +135,24 @@ impl<'a> Transaction<'a> {
         self.client.query_raw(statement, params).await
     }
 
+    /// Like `Client::query_raw_with_format`.
+    pub async fn query_raw_with_format<T, P, I>(
+        &self,
+        statement: &T,
+        params: I,
+        result_format: crate::ResultFormat,
+    ) -> Result<RowStream, Error>
+    where
+        T: ?Sized + ToStatement,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.client
+            .query_raw_with_format(statement, params, result_format)
+            .await
+    }
+
     /// Like `Client::query_typed`.
     pub async fn query_typed(
         &self,

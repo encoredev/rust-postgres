@@ -367,6 +367,27 @@ impl Client {
         query::query(&self.inner, statement, params).await
     }
 
+    /// Like `query_raw`, but allows specifying the result format (text or binary).
+    ///
+    /// With `ResultFormat::Text`, PostgreSQL returns column values as UTF-8 strings —
+    /// the same format the pg Node.js library receives. This is useful for building
+    /// driver adapters for ORMs that apply their own type parsing.
+    pub async fn query_raw_with_format<T, P, I>(
+        &self,
+        statement: &T,
+        params: I,
+        result_format: crate::ResultFormat,
+    ) -> Result<RowStream, Error>
+    where
+        T: ?Sized + ToStatement,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let statement = statement.__convert().into_statement(self).await?;
+        query::query_with_format(&self.inner, statement, params, result_format).await
+    }
+
     /// Like `query`, but requires the types of query parameters to be explicitly specified.
     ///
     /// Compared to `query`, this method allows performing queries without three round trips (for

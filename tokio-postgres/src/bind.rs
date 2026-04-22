@@ -22,7 +22,7 @@ where
 {
     let name = format!("p{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let buf = client.with_buf(|buf| {
-        query::encode_bind(&statement, params, &name, buf)?;
+        query::encode_bind(&statement, params, &name, query::ResultFormat::Binary, buf)?;
         frontend::sync(buf);
         Ok(buf.split().freeze())
     })?;

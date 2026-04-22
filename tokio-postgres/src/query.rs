@@ -18,6 +18,26 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// The format used to encode result column values in the PostgreSQL wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultFormat {
+    /// Text format — values are returned as UTF-8 strings,
+    /// the same format the pg Node.js library receives.
+    Text,
+    /// Binary format — values are returned in PostgreSQL's binary encoding.
+    /// This is more efficient but requires type-aware deserialization.
+    Binary,
+}
+
+impl ResultFormat {
+    fn format_code(self) -> i16 {
+        match self {
+            ResultFormat::Text => 0,
+            ResultFormat::Binary => 1,
+        }
+    }
+}
+
 struct BorrowToSqlParamsDebug<'a, T>(&'a [T]);
 
 impl<T> fmt::Debug for BorrowToSqlParamsDebug<'_, T>
@@ -41,6 +61,20 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
+    query_with_format(client, statement, params, ResultFormat::Binary).await
+}
+
+pub async fn query_with_format<P, I>(
+    client: &InnerClient,
+    statement: Statement,
+    params: I,
+    result_format: ResultFormat,
+) -> Result<RowStream, Error>
+where
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
+    I::IntoIter: ExactSizeIterator,
+{
     let buf = if log_enabled!(Level::Debug) {
         let params = params.into_iter().collect::<Vec<_>>();
         debug!(
@@ -48,15 +82,16 @@ where
             statement.name(),
             BorrowToSqlParamsDebug(params.as_slice()),
         );
-        encode(client, &statement, params)?
+        encode(client, &statement, params, result_format)?
     } else {
-        encode(client, &statement, params)?
+        encode(client, &statement, params, result_format)?
     };
     let responses = start(client, buf).await?;
     Ok(RowStream {
         statement,
         responses,
         rows_affected: None,
+        command_tag: None,
         _p: PhantomPinned,
     })
 }
@@ -76,7 +111,7 @@ where
 
         client.with_buf(|buf| {
             frontend::parse("", query, param_oids.into_iter(), buf).map_err(Error::parse)?;
-            encode_bind_raw("", params, "", buf)?;
+            encode_bind_raw("", params, "", ResultFormat::Binary, buf)?;
             frontend::describe(b'S', "", buf).map_err(Error::encode)?;
             frontend::execute("", 0, buf).map_err(Error::encode)?;
             frontend::sync(buf);
@@ -95,6 +130,7 @@ where
                     statement: Statement::unnamed(vec![], vec![]),
                     responses,
                     rows_affected: None,
+                    command_tag: None,
                     _p: PhantomPinned,
                 });
             }
@@ -115,6 +151,7 @@ where
                     statement: Statement::unnamed(vec![], columns),
                     responses,
                     rows_affected: None,
+                    command_tag: None,
                     _p: PhantomPinned,
                 });
             }
@@ -140,6 +177,7 @@ pub async fn query_portal(
         statement: portal.statement().clone(),
         responses,
         rows_affected: None,
+        command_tag: None,
         _p: PhantomPinned,
     })
 }
@@ -174,9 +212,9 @@ where
             statement.name(),
             BorrowToSqlParamsDebug(params.as_slice()),
         );
-        encode(client, &statement, params)?
+        encode(client, &statement, params, ResultFormat::Binary)?
     } else {
-        encode(client, &statement, params)?
+        encode(client, &statement, params, ResultFormat::Binary)?
     };
     let mut responses = start(client, buf).await?;
 
@@ -205,14 +243,19 @@ async fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
     Ok(responses)
 }
 
-pub fn encode<P, I>(client: &InnerClient, statement: &Statement, params: I) -> Result<Bytes, Error>
+pub fn encode<P, I>(
+    client: &InnerClient,
+    statement: &Statement,
+    params: I,
+    result_format: ResultFormat,
+) -> Result<Bytes, Error>
 where
     P: BorrowToSql,
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
     client.with_buf(|buf| {
-        encode_bind(statement, params, "", buf)?;
+        encode_bind(statement, params, "", result_format, buf)?;
         frontend::execute("", 0, buf).map_err(Error::encode)?;
         frontend::sync(buf);
         Ok(buf.split().freeze())
@@ -223,6 +266,7 @@ pub fn encode_bind<P, I>(
     statement: &Statement,
     params: I,
     portal: &str,
+    result_format: ResultFormat,
     buf: &mut BytesMut,
 ) -> Result<(), Error>
 where
@@ -239,6 +283,7 @@ where
         statement.name(),
         params.zip(statement.params().iter().cloned()),
         portal,
+        result_format,
         buf,
     )
 }
@@ -247,6 +292,7 @@ fn encode_bind_raw<P, I>(
     statement_name: &str,
     params: I,
     portal: &str,
+    result_format: ResultFormat,
     buf: &mut BytesMut,
 ) -> Result<(), Error>
 where
@@ -273,7 +319,7 @@ where
                 Err(e)
             }
         },
-        Some(1),
+        Some(result_format.format_code()),
         buf,
     );
     match r {
@@ -289,6 +335,7 @@ pin_project! {
         statement: Statement,
         responses: Responses,
         rows_affected: Option<u64>,
+        command_tag: Option<String>,
         #[pin]
         _p: PhantomPinned,
     }
@@ -306,6 +353,7 @@ impl Stream for RowStream {
                 }
                 Message::CommandComplete(body) => {
                     *this.rows_affected = Some(extract_row_affected(&body)?);
+                    *this.command_tag = extract_command_tag(&body).ok();
                 }
                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
                 Message::ReadyForQuery(_) => return Poll::Ready(None),
@@ -315,11 +363,35 @@ impl Stream for RowStream {
     }
 }
 
+/// Extract the command name (e.g. "SELECT", "INSERT") from a command complete tag.
+fn extract_command_tag(body: &CommandCompleteBody) -> Result<String, Error> {
+    let tag = body.tag().map_err(Error::parse)?;
+    // Tags look like "SELECT 5", "INSERT 0 1", "UPDATE 3", "DELETE 2", "CREATE TABLE"
+    // The command is everything before the last space-separated number(s).
+    Ok(tag
+        .split(' ')
+        .take_while(|part| part.parse::<u64>().is_err())
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
 impl RowStream {
+    /// Returns information about the columns of data in the rows.
+    pub fn columns(&self) -> &[Column] {
+        self.statement.columns()
+    }
+
     /// Returns the number of rows affected by the query.
     ///
     /// This function will return `None` until the stream has been exhausted.
     pub fn rows_affected(&self) -> Option<u64> {
         self.rows_affected
+    }
+
+    /// Returns the command tag from the query (e.g. "SELECT", "INSERT", "UPDATE").
+    ///
+    /// This function will return `None` until the stream has been exhausted.
+    pub fn command_tag(&self) -> Option<&str> {
+        self.command_tag.as_deref()
     }
 }
