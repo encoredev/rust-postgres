@@ -16,7 +16,7 @@ use tokio_util::codec::{Framed, FramedParts};
 use postgres_protocol::message::startup::{CancelData, StartupData, StartupResponse};
 
 use crate::config::SslNegotiation;
-use crate::connect_proxy::{connect_proxy, ProxyInfo};
+use crate::connect_proxy::connect_proxy;
 use crate::proxy::startup::{read_frontend_startup, StartupCodec, StartupInfo};
 use crate::tls::{MakeTlsConnect, TlsConnect};
 use crate::{CancelToken, Config, Error, Socket};
@@ -101,56 +101,70 @@ where
         let mut startup_stream = Framed::new(client_stream, StartupCodec::new());
 
         // Phase 1: client startup
-        let Some(mut accept) = self.client_startup(&mut startup_stream).await else {
+        let Some((mut accept, startup_data)) = self.client_startup(&mut startup_stream).await
+        else {
             return;
         };
 
         // Phase 2: backend startup
-        let backend_info = match connect_proxy(&mut accept.tls, &accept.backend_config).await {
-            Ok(backend_info) => backend_info,
-            Err(err) => {
-                _ = startup_stream
-                    .send(StartupResponse::ErrorResponse(format!(
-                        "backend connection failed: {:?}",
-                        err
-                    )))
-                    .await;
-                return;
+        let client_params = client_params(&startup_data, &accept.backend_config);
+        let backend_info =
+            match connect_proxy(&mut accept.tls, &accept.backend_config, &client_params).await {
+                Ok(backend_info) => backend_info,
+                Err(err) => {
+                    _ = startup_stream
+                        .send(StartupResponse::ErrorResponse(format!(
+                            "backend connection failed: {:?}",
+                            err
+                        )))
+                        .await;
+                    return;
+                }
+            };
+
+        // Register the cancel handle so cancellation requests can be handled,
+        // before the client is given the backend's key to send them with.
+        let cancel_registration = match backend_info.backend_key {
+            Some((process_id, secret_key)) => {
+                let reg = CancelHandleRegistration {
+                    key: CancelKey {
+                        process_id,
+                        secret_key,
+                    },
+                    lock: self.cancel_handles.clone(),
+                };
+                reg.register(CancelHandle {
+                    token: CancelToken {
+                        socket_config: Some(backend_info.socket_config),
+                        ssl_mode: accept.backend_config.ssl_mode,
+                        process_id,
+                        secret_key,
+                        ssl_negotiation: SslNegotiation::Postgres,
+                    },
+                    tls: accept.tls,
+                })
+                .await;
+                Some(reg)
             }
+            None => None,
         };
 
         // Notify the client that authentication is successful.
         if self
-            .complete_client_init(&mut startup_stream, &backend_info)
+            .complete_client_init(
+                &mut startup_stream,
+                &backend_info.parameters,
+                backend_info.backend_key,
+            )
             .await
             .is_err()
         {
             // Client is gone.
+            if let Some(reg) = cancel_registration {
+                reg.deregister().await;
+            }
             return;
         }
-
-        // Register the cancel handle so cancellation requests can be handled.
-        let cancel_registration = {
-            let reg = CancelHandleRegistration {
-                key: CancelKey {
-                    process_id: backend_info.process_id,
-                    secret_key: backend_info.secret_key,
-                },
-                lock: self.cancel_handles.clone(),
-            };
-            reg.register(CancelHandle {
-                token: CancelToken {
-                    socket_config: Some(backend_info.socket_config),
-                    ssl_mode: accept.backend_config.ssl_mode,
-                    process_id: backend_info.process_id,
-                    secret_key: backend_info.secret_key,
-                    ssl_negotiation: SslNegotiation::Postgres,
-                },
-                tls: accept.tls,
-            })
-            .await;
-            reg
-        };
 
         // Proxy data in both directions.
         let proxy_result = {
@@ -160,7 +174,9 @@ where
         };
 
         // Remove the cancel registration.
-        cancel_registration.deregister().await;
+        if let Some(reg) = cancel_registration {
+            reg.deregister().await;
+        }
 
         match proxy_result {
             Ok(()) => log::debug!("proxy connection closed"),
@@ -168,13 +184,14 @@ where
         }
     }
 
-    /// Handles starting up a client connection.
+    /// Handles starting up a client connection, returning how to proxy it along
+    /// with the client's startup data.
     /// It returns None if the connection should be closed, whether for authentication issues
     /// or because the client requested cancellation.
     async fn client_startup<S>(
         &self,
         startup_stream: &mut Framed<S, StartupCodec>,
-    ) -> Option<AcceptConn<B::Tls>>
+    ) -> Option<(AcceptConn<B::Tls>, StartupData)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -200,7 +217,7 @@ where
                         {
                             Ok(()) => {
                                 // Successfully authenticated.
-                                Some(accept)
+                                Some((accept, startup_data))
                             }
                             Err(err) => {
                                 // Failed to authenticate.
@@ -234,7 +251,8 @@ where
     async fn complete_client_init<S>(
         &self,
         startup_stream: &mut Framed<S, StartupCodec>,
-        backend_info: &ProxyInfo<B::Tls>,
+        parameters: &HashMap<String, String>,
+        backend_key: Option<(i32, i32)>,
     ) -> Result<(), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -246,8 +264,7 @@ where
             .map_err(Error::io)?;
 
         // Send backend parameters, sorted by key.
-        let mut parameters = backend_info
-            .parameters
+        let mut parameters = parameters
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<Vec<_>>();
@@ -259,6 +276,18 @@ where
                 value: Bytes::from(value),
             };
             startup_stream.feed(msg).await.map_err(Error::io)?;
+        }
+
+        // Send the backend's cancellation key, which the client's cancellation
+        // requests to this proxy are looked up by.
+        if let Some((process_id, secret_key)) = backend_key {
+            startup_stream
+                .feed(StartupResponse::BackendKeyData {
+                    process_id,
+                    secret_key,
+                })
+                .await
+                .map_err(Error::io)?;
         }
 
         // Send ReadyForQuery
@@ -285,6 +314,31 @@ where
             _ = handle.token.cancel_query(tls).await;
         }
     }
+}
+
+/// The startup parameters a client passes on to its backend: all it sent but
+/// `user` and `database`, which the backend config decides, and protocol
+/// options (`_pq_.*`), which the proxy does not negotiate. The client's
+/// `options` follow the config's, so they add to them, and take precedence
+/// over them where both set the same thing.
+fn client_params(startup: &StartupData, config: &Config) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    for (key, value) in &startup.parameters {
+        if matches!(key.as_str(), "user" | "database") || key.starts_with("_pq_.") {
+            continue;
+        }
+        let Ok(value) = std::str::from_utf8(value) else {
+            log::warn!("dropping startup parameter {key}: its value is not UTF-8");
+            continue;
+        };
+        let value = match (key.as_str(), config.get_options()) {
+            ("options", Some(options)) => format!("{options} {value}"),
+            _ => value.to_string(),
+        };
+        params.push((key.clone(), value));
+    }
+    params.sort();
+    params
 }
 
 async fn proxy_data<C, CC, S, SC>(

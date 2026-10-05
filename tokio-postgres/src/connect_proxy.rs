@@ -20,12 +20,19 @@ where
 {
     pub backend: Framed<MaybeTlsStream<Socket, T::Stream>, PostgresCodec>,
     pub socket_config: SocketConfig,
-    pub process_id: i32,
-    pub secret_key: i32,
+    /// The backend's cancellation key, as process ID and secret key, if it
+    /// gave one.
+    pub backend_key: Option<(i32, i32)>,
     pub parameters: HashMap<String, String>,
 }
 
-pub(crate) async fn connect_proxy<T>(tls: &mut T, config: &Config) -> Result<ProxyInfo<T>, Error>
+/// Connects to the backend `config` describes on behalf of a proxy's client,
+/// starting up with the parameters the client passes on.
+pub(crate) async fn connect_proxy<T>(
+    tls: &mut T,
+    config: &Config,
+    client_params: &[(String, String)],
+) -> Result<ProxyInfo<T>, Error>
 where
     T: MakeTlsConnect<Socket>,
 {
@@ -91,7 +98,7 @@ where
             _ => "".to_string(),
         };
 
-        match connect_host(addr, hostname, port, tls, config).await {
+        match connect_host(addr, hostname, port, tls, config, client_params).await {
             Ok(info) => return Ok(info),
             Err(e) => {
                 log::error!(
@@ -113,6 +120,7 @@ async fn connect_host<T>(
     port: u16,
     tls: &mut T,
     config: &Config,
+    client_params: &[(String, String)],
 ) -> Result<ProxyInfo<T>, Error>
 where
     T: MakeTlsConnect<Socket>,
@@ -130,8 +138,15 @@ where
 
             let mut last_err = None;
             for addr in addrs {
-                match connect_once(Addr::Tcp(addr.ip()), hostname.as_deref(), port, tls, config)
-                    .await
+                match connect_once(
+                    Addr::Tcp(addr.ip()),
+                    hostname.as_deref(),
+                    port,
+                    tls,
+                    config,
+                    client_params,
+                )
+                .await
                 {
                     Ok(stream) => return Ok(stream),
                     Err(e) => {
@@ -150,7 +165,15 @@ where
         }
         #[cfg(unix)]
         Host::Unix(path) => {
-            connect_once(Addr::Unix(path), hostname.as_deref(), port, tls, config).await
+            connect_once(
+                Addr::Unix(path),
+                hostname.as_deref(),
+                port,
+                tls,
+                config,
+                client_params,
+            )
+            .await
         }
     }
 }
@@ -161,6 +184,7 @@ async fn connect_once<T>(
     port: u16,
     tls: &mut T,
     config: &Config,
+    client_params: &[(String, String)],
 ) -> Result<ProxyInfo<T>, Error>
 where
     T: MakeTlsConnect<Socket>,
@@ -183,8 +207,8 @@ where
         .map_err(|e| Error::tls(e.into()))?;
     let has_hostname = hostname.is_some();
 
-    let (stream, process_id, secret_key, parameters) =
-        connect_proxy_raw(socket, tls, has_hostname, config).await?;
+    let (stream, backend_key, parameters) =
+        connect_proxy_raw(socket, tls, has_hostname, config, client_params).await?;
 
     let socket_config = SocketConfig {
         addr,
@@ -201,8 +225,7 @@ where
     Ok(ProxyInfo {
         backend: stream,
         socket_config,
-        process_id,
-        secret_key,
+        backend_key,
         parameters,
     })
 }

@@ -206,6 +206,7 @@ pub enum StartupResponse {
     GSSEncResponse(bool),
     ErrorResponse(String),
     ParameterStatus { key: String, value: Bytes },
+    BackendKeyData { process_id: i32, secret_key: i32 },
     ReadyForQuery,
 }
 
@@ -263,6 +264,17 @@ impl StartupResponse {
                 dst.put_u8(0);
                 dst.put_slice(value_bytes);
                 dst.put_u8(0);
+            }
+
+            StartupResponse::BackendKeyData {
+                process_id,
+                secret_key,
+            } => {
+                dst.reserve(1 + 12);
+                dst.put_u8(b'K');
+                dst.put_u32(12);
+                dst.put_i32(*process_id);
+                dst.put_i32(*secret_key);
             }
 
             StartupResponse::ReadyForQuery => {

@@ -112,9 +112,10 @@ where
         .as_deref()
         .map_or_else(|| Cow::Owned(whoami::username()), Cow::Borrowed);
 
-    startup(&mut stream, config, &user).await?;
+    startup(&mut stream, config, &user, &[]).await?;
     authenticate(&mut stream, config, &user).await?;
-    let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
+    let (backend_key, parameters) = read_info(&mut stream).await?;
+    let (process_id, secret_key) = backend_key.unwrap_or_default();
 
     let (sender, receiver) = mpsc::unbounded();
     let client = Client::new(
@@ -129,16 +130,19 @@ where
     Ok((client, connection))
 }
 
+/// Starts up a connection to a backend on behalf of a proxy's client, with the
+/// startup parameters it passes on (see [`startup`]). Returns the connection,
+/// the backend's cancellation key if it gave one, and its parameters.
 pub async fn connect_proxy_raw<S, T>(
     stream: S,
     tls: T,
     has_hostname: bool,
     config: &Config,
+    client_params: &[(String, String)],
 ) -> Result<
     (
         Framed<MaybeTlsStream<S, T::Stream>, PostgresCodec>,
-        i32,
-        i32,
+        Option<(i32, i32)>,
         HashMap<String, String>,
     ),
     Error,
@@ -167,16 +171,19 @@ where
         .as_deref()
         .map_or_else(|| Cow::Owned(whoami::username()), Cow::Borrowed);
 
-    startup(&mut stream, config, &user).await?;
+    startup(&mut stream, config, &user, client_params).await?;
     authenticate(&mut stream, config, &user).await?;
-    let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
-    Ok((stream.inner, process_id, secret_key, parameters))
+    let (backend_key, parameters) = read_info(&mut stream).await?;
+    Ok((stream.inner, backend_key, parameters))
 }
 
+/// Sends the startup message: the parameters `config` sets, with each of
+/// `client_params` replacing the one of the same name or added after them.
 async fn startup<S, T>(
     stream: &mut StartupStream<S, T>,
     config: &Config,
     user: &str,
+    client_params: &[(String, String)],
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -192,6 +199,12 @@ where
     }
     if let Some(application_name) = &config.application_name {
         params.push(("application_name", &**application_name));
+    }
+    for (key, value) in client_params {
+        match params.iter_mut().find(|(k, _)| *k == key.as_str()) {
+            Some(param) => param.1 = value.as_str(),
+            None => params.push((key.as_str(), value.as_str())),
+        }
     }
 
     let mut buf = BytesMut::new();
@@ -380,22 +393,23 @@ where
     Ok(())
 }
 
+/// Reads what the backend reports once authenticated, up to it being ready for
+/// queries: its cancellation key, as process ID and secret key, if it gives
+/// one, and its parameters.
 async fn read_info<S, T>(
     stream: &mut StartupStream<S, T>,
-) -> Result<(i32, i32, HashMap<String, String>), Error>
+) -> Result<(Option<(i32, i32)>, HashMap<String, String>), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut process_id = 0;
-    let mut secret_key = 0;
+    let mut backend_key = None;
     let mut parameters = HashMap::new();
 
     loop {
         match stream.try_next().await.map_err(Error::io)? {
             Some(Message::BackendKeyData(body)) => {
-                process_id = body.process_id();
-                secret_key = body.secret_key();
+                backend_key = Some((body.process_id(), body.secret_key()));
             }
             Some(Message::ParameterStatus(body)) => {
                 parameters.insert(
@@ -406,7 +420,7 @@ where
             Some(msg @ Message::NoticeResponse(_)) => {
                 stream.delayed.push_back(BackendMessage::Async(msg))
             }
-            Some(Message::ReadyForQuery(_)) => return Ok((process_id, secret_key, parameters)),
+            Some(Message::ReadyForQuery(_)) => return Ok((backend_key, parameters)),
             Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
             Some(_) => return Err(Error::unexpected_message()),
             None => return Err(Error::closed()),
