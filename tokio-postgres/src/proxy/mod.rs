@@ -309,9 +309,16 @@ where
             secret_key: cancel.secret_key,
         };
 
-        if let Some(handle) = self.cancel_handles.read().await.get(&key) {
-            let tls = handle.tls.clone();
-            _ = handle.token.cancel_query(tls).await;
+        // Copied out, so the lock is not held while the backend is dialed: a
+        // slow backend would otherwise hold up every connection registering.
+        let handle = self
+            .cancel_handles
+            .read()
+            .await
+            .get(&key)
+            .map(|handle| (handle.token.clone(), handle.tls.clone()));
+        if let Some((token, tls)) = handle {
+            _ = token.cancel_query(tls).await;
         }
     }
 }
