@@ -39,6 +39,17 @@ pub enum RejectConn {
     InternalError,
 }
 
+impl RejectConn {
+    /// The SQLSTATE reported to the client for this rejection.
+    pub fn sqlstate(&self) -> &'static str {
+        match self {
+            RejectConn::UnknownDatabase => "3D000", // invalid_catalog_name
+            RejectConn::UnknownUser => "28000",     // invalid_authorization_specification
+            RejectConn::InternalError => "XX000",   // internal_error
+        }
+    }
+}
+
 impl std::fmt::Display for RejectConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -113,10 +124,10 @@ where
                 Ok(backend_info) => backend_info,
                 Err(err) => {
                     _ = startup_stream
-                        .send(StartupResponse::ErrorResponse(format!(
-                            "backend connection failed: {:?}",
-                            err
-                        )))
+                        .send(StartupResponse::ErrorResponse {
+                            code: "08006", // connection_failure
+                            message: format!("backend connection failed: {:?}", err),
+                        })
                         .await;
                     return;
                 }
@@ -225,9 +236,10 @@ where
 
                                 // Ignore error from sending to client; we already have an error to return.
                                 _ = startup_stream
-                                    .send(StartupResponse::ErrorResponse(
-                                        "authentication failed".to_string(),
-                                    ))
+                                    .send(StartupResponse::ErrorResponse {
+                                        code: "28P01", // invalid_password
+                                        message: "authentication failed".to_string(),
+                                    })
                                     .await;
                                 None
                             }
@@ -237,9 +249,10 @@ where
                         log::error!("connection rejected: {}", reject);
                         // Ignore error from sending to client; we already have an error to return.
                         _ = startup_stream
-                            .send(StartupResponse::ErrorResponse(
-                                "connection rejected".to_string(),
-                            ))
+                            .send(StartupResponse::ErrorResponse {
+                                code: reject.sqlstate(),
+                                message: format!("connection rejected: {}", reject),
+                            })
                             .await;
                         None
                     }
