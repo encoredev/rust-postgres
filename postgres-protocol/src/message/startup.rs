@@ -204,7 +204,7 @@ pub enum StartupResponse {
     AuthenticationMD5Password { salt: [u8; 4] },
     SSLResponse(bool),
     GSSEncResponse(bool),
-    ErrorResponse(String),
+    ErrorResponse { code: &'static str, message: String },
     ParameterStatus { key: String, value: Bytes },
     BackendKeyData { process_id: i32, secret_key: i32 },
     ReadyForQuery,
@@ -234,15 +234,22 @@ impl StartupResponse {
                 dst.reserve(1);
                 dst.put_u8(if *ok { b'G' } else { b'N' });
             }
-            StartupResponse::ErrorResponse(err) => {
-                let err_bytes = err.as_bytes();
-                let len = 4 + (1 + 5 + 1) + (1 + err_bytes.len() + 1) + 1;
+            StartupResponse::ErrorResponse { code, message } => {
+                let code_bytes = code.as_bytes();
+                let err_bytes = message.as_bytes();
+                let len =
+                    4 + (1 + 5 + 1) + (1 + code_bytes.len() + 1) + (1 + err_bytes.len() + 1) + 1;
                 dst.reserve(1 + len);
                 dst.put_u8(b'E');
                 dst.put_u32(len as u32);
 
                 dst.put_u8(b'S');
                 dst.put_slice(b"FATAL");
+                dst.put_u8(0);
+
+                // Clients reject an ErrorResponse without a SQLSTATE.
+                dst.put_u8(b'C');
+                dst.put_slice(code_bytes);
                 dst.put_u8(0);
 
                 dst.put_u8(b'M');
@@ -288,4 +295,41 @@ impl StartupResponse {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use fallible_iterator::FallibleIterator;
 
+    use super::*;
+    use crate::message::backend::Message;
+
+    #[test]
+    fn error_response_is_parseable_by_clients() {
+        let mut buf = BytesMut::new();
+        StartupResponse::ErrorResponse {
+            code: "3D000",
+            message: "connection rejected: unknown database".to_string(),
+        }
+        .encode(&mut buf)
+        .unwrap();
+
+        let body = match Message::parse(&mut buf).unwrap() {
+            Some(Message::ErrorResponse(body)) => body,
+            _ => panic!("expected an ErrorResponse"),
+        };
+        assert!(buf.is_empty());
+
+        let fields: Vec<(u8, Vec<u8>)> = body
+            .fields()
+            .map(|f| Ok((f.type_(), f.value_bytes().to_vec())))
+            .collect()
+            .unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                (b'S', b"FATAL".to_vec()),
+                (b'C', b"3D000".to_vec()),
+                (b'M', b"connection rejected: unknown database".to_vec()),
+            ]
+        );
+    }
+}
